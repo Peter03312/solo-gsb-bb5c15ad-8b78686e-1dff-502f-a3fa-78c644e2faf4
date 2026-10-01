@@ -1,0 +1,23 @@
+services:
+  exam-api:
+    build: .
+    image: exam-paper-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据库文件路径（容器内路径）；可按需修改
+      EXAM_DB_PATH: /data/exam.db
+    volumes:
+      - exam_data:/data
+    restart: unless-stopped
+    healthcheck:
+      # 依赖已烘焙进镜像，进程通常数秒内就绪；start_period 内的失败不计入
+      # 重试次数，避免冷启动/卷恢复时被 --wait 误判失败。
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  exam_data:
