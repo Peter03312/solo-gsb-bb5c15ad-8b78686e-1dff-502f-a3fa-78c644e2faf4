@@ -6,7 +6,7 @@
   - 回避：审阅人不得分配到其声明的不可审卷号；
   - 容量：每名审阅人分到的卷数不超过其容量（跨卷合计）。
 
-择优规则（字典序，逐层最优后固定再优化下一层，与组卷求解器同一风格）：
+择优规则（字典序，逐层最优后固定再优化下一层，与组卷/排布求解器同一风格）：
   1. 最大个人负载（单人分到的卷数）最小；
   2. 各人负载相对平均值的绝对偏差总和最小
      （平均负载 = 总分配数 / 审阅人数，总分配数固定，故为定值）；
@@ -15,12 +15,20 @@
      （即最大化降权编码），分块处理避免指数权重溢出，同时唯一破缺
      审阅人之间的对称性，结果可复现。
 
-无解时不返回任何部分方案，仅给出各卷可用人力与总容量缺口。
-全部求解单线程、固定随机种子，同一任务同一请求结果可复现。
+**最优性证明（仅证明最优才返回可行方案）**：三个择优阶段（含编号破平的
+每个分块）都必须从求解器取得 ``OPTIMAL``。限时内只找到可行解而未证明最优
+（``FEASIBLE``）或完全无法判定（``UNKNOWN`` 等）时立即返回 ``error`` 且
+**不附带任何分配方案**——只“可行”的解最大负载可能并非最小；偏差阶段超时
+退回上一阶段方案会让绝对偏差未经优化；首个未证明的破平分块之前的分配只对
+已固定分块最优，整段编号序列不满足字典序规则。绝不沿用上一阶段的解充当
+公开承诺的择优结果。只有阶段 1 在完整约束下被**证明无解（``INFEASIBLE``）**
+时才返回 ``infeasible`` 及既有的各卷可用人力与总容量缺口诊断。
+无解时不返回任何部分方案。全部求解单线程、固定随机种子，同一任务同一请求
+结果可复现。
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from ortools.sat.python import cp_model
 
@@ -107,11 +115,15 @@ def solve_review_plan(
     paper_count: int,
     seed: int = 42,
 ) -> Dict[str, Any]:
-    """求解盲审分配，返回可行方案或（无解时的）人力诊断，绝不返回部分方案。
+    """求解盲审分配，返回可行方案或（证明无解时的）人力诊断，绝不返回部分方案。
 
     reviewers 元素为 {"reviewer_id": ..., "capacity": ..., "excluded_papers": [...]}；
     审阅人编号可为数字或字符串，按与题号同一口径规范化排序后参与求解，
     输入顺序不影响分配结果。
+
+    三个择优阶段（含编号破平的每个分块）都必须取得 ``OPTIMAL``：只找到可行
+    解而未证明最优或无法判定时返回 ``error``（不含 assignments/loads），绝不
+    退回上一阶段方案；只有完整约束被证明无解时才返回 ``infeasible`` 诊断。
     """
     R = len(reviewers)
     P = paper_count
@@ -158,48 +170,60 @@ def solve_review_plan(
             "papers": papers_diag,
         }
 
-    # 阶段 1：最大个人负载最小
+    def error_result(message: str) -> Dict[str, Any]:
+        # 错误结构只含回显字段与诊断，绝不携带 assignments/loads/max_load
+        return {"status": "error", **base, "error": message}
+
+    def chosen_of(
+        solver: cp_model.CpSolver, x: List[List[cp_model.IntVar]]
+    ) -> List[List[bool]]:
+        return [[bool(solver.Value(x[r][p])) for p in range(P)] for r in range(R)]
+
+    # 阶段 1：最大个人负载最小。
+    # 必须取得 OPTIMAL：FEASIBLE（仅找到可行解、未证明最优）时其目标值可能并非
+    # 全局最小，把它固定下来会让后续分配满足容量却不满足“最大负载最小”承诺。
     m, x, loads, max_load = _build_model(caps, excluded, P, k)
     m.Minimize(max_load)
     s = _solver(seed)
     status = s.Solve(m)
     if status == cp_model.INFEASIBLE:
         return infeasible()
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return {
-            "status": "error",
-            **base,
-            "error": "求解器在规定时间内无法判定可行性",
-        }
+    if status != cp_model.OPTIMAL:
+        # FEASIBLE（只找到可行解，未证明最优）/ UNKNOWN（未得解）同样拒绝
+        return error_result("求解器在规定时间内无法证明最大个人负载的最优值")
     best_max = int(s.Value(max_load))
-    chosen: List[List[bool]] = [
-        [bool(s.Value(x[r][p])) for p in range(P)] for r in range(R)
-    ]
+    chosen = chosen_of(s, x)
 
-    # 阶段 2：各人负载相对平均值的绝对偏差总和最小
+    # 阶段 2：各人负载相对平均值的绝对偏差总和最小（固定已证明的最小最大负载）。
+    # 同样必须证明最优：限时内只找到可行解时其偏差可能并非最小，**绝不退回阶段 1
+    # 的解**——那将输出未经偏差择优、与公开承诺不符的方案。
     m, x, loads, max_load = _build_model(caps, excluded, P, k)
     m.Add(max_load == best_max)
     deviation = _deviation_expr(m, loads, total)
     m.Minimize(deviation)
     s = _solver(seed)
     status = s.Solve(m)
-    best_dev: Optional[int] = None
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        best_dev = int(s.Value(deviation))
-        chosen = [[bool(s.Value(x[r][p])) for p in range(P)] for r in range(R)]
-    # 退化：阶段 2 超时则沿用阶段 1 的解，阶段 3 不固定偏差
+    # 阶段 1 已有可行见证且本层只增固定等式：INFEASIBLE 只可能来自求解器数值
+    # 异常，按“未能证明”处理，绝不退化为任意可行解。
+    if status != cp_model.OPTIMAL:
+        return error_result(
+            "求解器在规定时间内无法证明负载相对平均负载绝对偏差总和的最优值"
+        )
+    best_dev = int(s.Value(deviation))
+    chosen = chosen_of(s, x)
 
     # 阶段 3：按卷号展平的审阅人编号序列最小。
     # 逐卷、逐块最大化降权编码（等价于选中编号列表的字典序最小化），
     # 并固定此前各卷各块的最优值——卷间与审阅人间的对称被唯一破缺。
+    # 每个分块都必须证明最优：首个未证明分块之前沿用上一阶段的分配只对已固定
+    # 分块最优，整段编号序列不满足字典序规则，因此直接 error，不返回任何方案。
     n_chunks = (R + CHUNK_BITS - 1) // CHUNK_BITS
     fixed: List[Tuple[int, int, int]] = []  # (卷 p, 块 k, 块值)
     for p in range(P):
         for ck in range(n_chunks):
             m, x, loads, max_load = _build_model(caps, excluded, P, k)
             m.Add(max_load == best_max)
-            if best_dev is not None:
-                m.Add(_deviation_expr(m, loads, total) == best_dev)
+            m.Add(_deviation_expr(m, loads, total) == best_dev)
             # x 以审阅人为主下标，按卷取列向量（长度 R）参与分块编码
             cols = [[x[r][q] for r in range(R)] for q in range(P)]
             for fp, fk, fv in fixed:
@@ -208,10 +232,28 @@ def solve_review_plan(
             m.Maximize(enc)
             s = _solver(seed)
             status = s.Solve(m)
-            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                break  # 保留此前已得的最优解
+            if status != cp_model.OPTIMAL:
+                return error_result(
+                    "求解器在规定时间内无法证明审阅人编号序列分块的字典序最优"
+                )
             fixed.append((p, ck, int(s.Value(enc))))
-            chosen = [[bool(s.Value(x[r][q])) for q in range(P)] for r in range(R)]
+            chosen = chosen_of(s, x)
+
+    # 最终一致性校验：回算负载与各硬约束，与已证明的最优值不符说明得到的分配
+    # 不满足择优结果，宁可报错也不返回伪最优方案。
+    final_max = max(sum(chosen[r]) for r in range(R))
+    if final_max != best_max:
+        return error_result("内部校验失败：最终分配的最大负载与已证明的最优值不一致")
+    for r in range(R):
+        load_r = sum(chosen[r])
+        if load_r > caps[r]:
+            return error_result("内部校验失败：最终分配超出审阅人容量")
+        for p in excluded[r]:
+            if chosen[r][p]:
+                return error_result("内部校验失败：最终分配违反回避约束")
+    for p in range(P):
+        if sum(chosen[r][p] for r in range(R)) != k:
+            return error_result("内部校验失败：最终分配的每卷人数与请求不一致")
 
     assignments = [
         {"paper": p, "reviewer_ids": [ids[r] for r in range(R) if chosen[r][p]]}
@@ -228,7 +270,7 @@ def solve_review_plan(
     return {
         "status": "feasible",
         **base,
-        "max_load": max(sum(chosen[r]) for r in range(R)),
+        "max_load": final_max,
         "assignments": assignments,
         "loads": loads_out,
     }

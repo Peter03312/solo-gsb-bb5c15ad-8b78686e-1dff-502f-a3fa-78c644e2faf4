@@ -74,7 +74,7 @@ app = FastAPI(
         "，以及面向已完成可行任务首个候选卷组的成绩批次发布"
         "（单事务快照一次性冻结全批逐题有效分与总分）"
     ),
-    version="1.13.0",
+    version="1.14.0",
     lifespan=lifespan,
 )
 
@@ -425,7 +425,11 @@ def create_review_plan(task_id: int, payload: ReviewPlanIn) -> ReviewPlanOut:
     `reviewers_per_paper` 名审阅人（同卷不重复）、审阅人回避其不可审卷号、
     每人跨卷合计不超过其容量。依次最小化：最大个人负载 → 各人负载相对
     平均值的绝对偏差总和 → 按卷号展平的审阅人编号序列（结果可复现）。
-    无解时返回 `infeasible` 及各卷可用人力与总容量缺口，不返回部分方案。
+
+    三个择优阶段（含序列破平的每个分块）都必须取得 OPTIMAL：只找到可行解
+    而未证明最优、或限时内无法判定时返回 `error` 且**不附任何分配方案**
+    （绝不退回上一阶段方案）；只有被证明无解时才返回 `infeasible` 及各卷
+    可用人力与总容量缺口诊断。普通与改卷任务均按冻结卷数处理。
     """
     row = database.get_task(task_id)
     if row is None:
