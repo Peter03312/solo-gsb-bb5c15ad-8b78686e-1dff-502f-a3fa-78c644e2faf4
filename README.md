@@ -8,7 +8,7 @@
 
 此外支持对已完成且可行的任务**定向改卷**（`POST /api/tasks/{task_id}/revise`）：按卷指定必须保留/移除的题号，联合重求解全部卷并在满足原约束的前提下**最大化各卷保留原题总数**，详见下文[定向改卷](#定向改卷post-apitaskstask_idrevise)。
 
-还提供**盲审分配**（`POST /api/tasks/{task_id}/review-plan`）：为已完成且结果可行的组卷任务把审阅人**联合分配**到各卷——满足同卷不重复、回避（不可审卷号）与总容量约束，并依次最小化**最大个人负载 → 负载相对平均值的绝对偏差总和 → 按卷号展平的审阅人编号序列**，结果可复现；无解时返回各卷可用人力与总容量缺口，绝不返回部分方案，详见下文[盲审分配](#盲审分配post-apitaskstask_idreview-plan)。
+还提供**盲审分配**（`POST /api/tasks/{task_id}/review-plan`）：为已完成且结果可行的组卷任务把审阅人**联合分配**到各卷——满足同卷不重复、回避（不可审卷号）与总容量约束，并依次最小化**最大个人负载 → 负载相对平均值的绝对偏差总和 → 按卷号展平的审阅人编号序列**，结果可复现；**每个择优阶段（含编号序列破平的每个分块）都必须证明最优才返回方案**，任一阶段限时内未证明最优或无法判定即返回 `error`（不附任何分配方案），只有证明无解才返回 `infeasible` 及各卷可用人力与总容量缺口，绝不返回部分方案，详见下文[盲审分配](#盲审分配post-apitaskstask_idreview-plan)。
 
 还提供**考场卷别排布**（`POST /api/tasks/{task_id}/seat-plan`）：为已完成且**含 2～5 份平行卷**的可行任务，在不超过 6×6 的考场中按各卷印量排布座位——每个可用座位放 1 份卷、每卷放满印量，按上下左右相邻统计**同卷别接触边数**并求全局最少；同最优值按**行优先、卷号升序**唯一固定排布，同步返回逐座卷号、空位与接触边数，详见下文[考场卷别排布](#考场卷别排布post-apitaskstask_idseat-plan)。
 
@@ -162,6 +162,54 @@ curl -X POST http://localhost:8000/api/tasks/12/quota/confirm \
 # 6) 审计链对 error/void 同样闭合（finished -> quota_settled{outcome:"void"}）
 curl http://localhost:8000/api/tasks/12/audit
 # -> {"valid": true, "events": [created, started, finished, quota_settled], ...}
+```
+
+## 本轮用法及调用示例（盲审分配择优证明）
+
+盲审分配（`POST /api/tasks/{task_id}/review-plan`）本轮起与组卷求解器采用同一判定口径：在每卷人数、同卷不重复、回避与容量约束均满足的前提下，**依次证明最大个人负载最小 → 负载绝对偏差总和最小 → 按卷号及审阅人编号的序列最小**，只有全部择优阶段（含编号序列破平的每个分块）都取得最优性证明才返回 `feasible` 方案；**任一阶段限时内只找到可行解而未证明最优、或无法判定时返回 `error` 且不附任何分配方案**（偏差阶段超时不再退回上一阶段方案）；只有**证明无解**才返回 `infeasible` 及既有缺口诊断。请求字段、状态值与可行方案结构保持不变；普通、模板与改卷任务均按其冻结的卷数处理。
+
+完整调用流程（先有可用的组卷任务，再同步请求盲审分配）：
+
+```bash
+# 1) 创建组卷任务（普通任务；模板实例化、定向改卷任务同样可作为源任务）
+curl -X POST http://localhost:8000/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"questions": [ /* 题库快照 */ ], "total_score": 100,
+       "difficulty_range": [0.4, 0.6], "paper_count": 3, "seed": 42}'
+# -> 201 {"task_id": 42, "status": "pending"}
+
+# 2) 轮询直到 done 且 result.status = "feasible"
+curl http://localhost:8000/api/tasks/42
+
+# 3) 同步请求盲审分配：输入审阅人编号、跨卷容量、回避卷号和每卷所需人数
+curl -X POST http://localhost:8000/api/tasks/42/review-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "reviewers": [
+      {"reviewer_id": "R1", "capacity": 3, "excluded_papers": [0]},
+      {"reviewer_id": "R2", "capacity": 2, "excluded_papers": []},
+      {"reviewer_id": "R3", "capacity": 2, "excluded_papers": [2]},
+      {"reviewer_id": "R4", "capacity": 3, "excluded_papers": []}
+    ],
+    "reviewers_per_paper": 2
+  }'
+```
+
+按 `status` 处理三种结果（HTTP 均为 `200`）：
+
+- `"feasible"`：全部择优阶段均已证明最优，`assignments` / `loads` / `max_load` 为最终方案，可直接采用；同一任务同一请求重复调用结果完全一致。
+- `"infeasible"`：已**证明**不存在满足全部回避与容量约束的分配，按 `capacity_gap` 与 `papers[i].shortage` 定位人力缺口（增补审阅人、放宽回避或调大容量后重试）。
+- `"error"`：某阶段限时内未证明最优或无法判定，响应仅含回显字段与 `error`，**没有任何分配数据**；可稍后原样重试（请求与种子不变，结果可复现）。
+
+```bash
+# 4) error 结果示例（不附 assignments/loads/max_load）
+# {"task_id": 42, "status": "error", "paper_count": 3,
+#  "reviewers_per_paper": 2, "required_total": 6,
+#  "error": "求解器在规定时间内无法证明负载绝对偏差总和的最优值"}
+
+# 5) infeasible 结果示例（既有缺口诊断保持不变）
+# {"task_id": 42, "status": "infeasible", "capacity_total": 2, "capacity_gap": 4,
+#  "papers": [{"paper": 0, "required": 2, "available_count": 2, ...}, ...]}
 ```
 
 ## 请求示例
@@ -543,6 +591,8 @@ curl -X POST http://localhost:8000/api/tasks/42/revise \
   2. **各人负载相对平均值的绝对偏差总和**最小（平均负载 = 总分配数 ÷ 审阅人数）；
   3. **按卷号展平的审阅人编号序列**最小（逐卷把选中审阅人的规范排序编号列表按字典序最小化，唯一破缺对称性，保证可复现）。
 
+> **最优性保证（仅证明最优才返回方案）**：三个择优层级逐层求解并固定**已证明**的最优值，编号序列进一步按卷逐分块求字典序最小。只有当每一层目标、以及编号序列破平的**每一个分块**都从求解器取得 `OPTIMAL`（已证明最优）时，才返回 `feasible` 方案。任一阶段在限时内**只找到可行解而未证明最优**（或完全无法判定）时，返回 `error` 且**不携带 `assignments` / `loads` / `max_load` 等任何部分方案**——偏差阶段超时不得退回上一阶段方案（其偏差未必最小），破平分块未完成时此前的解也只对已固定分块最优，整段序列不满足字典序规则。只有首阶段被**证明无解**时才返回 `infeasible` 及缺口诊断。常规规模（数十名审阅人、≤5 份卷）通常在毫秒级完成全部证明；下列“限时场景”仅在求解器受限时出现。
+
 ### 请求示例
 
 ```bash
@@ -622,6 +672,40 @@ curl -X POST http://localhost:8000/api/tasks/42/review-plan \
 
 - `capacity_total`：审阅人合计可承接卷数（每人按其未回避卷数截断后求和）；`capacity_gap = max(0, required_total - capacity_total)` 为总容量缺口；
 - `papers[i]`：第 `i` 卷的所需人数、可用人数与可用审阅人名单，`shortage` 为该卷人数缺口——总容量充足但分布不均（回避过于集中）时，可据此定位问题卷。
+
+### 限时场景（`error`，不返回部分方案）
+
+求解器为“最大个人负载”“负载绝对偏差总和”以及编号序列的每个破平分块分别设定了求解限时（单线程、固定种子）。若某一阶段限时内**只找到可行解却未证明最优**，或完全无法判定，接口同步返回 HTTP `200`、`status: "error"` 与诊断信息；响应**只含回显字段**（`paper_count` / `reviewers_per_paper` / `required_total`）与 `error`，不含 `max_load`、`assignments`、`loads` 等任何部分方案，调用方可在稍后原样重试（请求与种子不变，结果可复现；一旦全部阶段证明最优即返回可行方案）：
+
+```bash
+curl -X POST http://localhost:8000/api/tasks/42/review-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "reviewers": [ /* ……审阅人名单…… */ ],
+    "reviewers_per_paper": 2
+  }'
+```
+
+最大个人负载未能在限时内证明最优时：
+
+```json
+{
+  "task_id": 42,
+  "status": "error",
+  "paper_count": 3,
+  "reviewers_per_paper": 2,
+  "required_total": 6,
+  "error": "求解器在规定时间内无法证明最大个人负载的最优值"
+}
+```
+
+不同阶段未完成证明时，`error` 信息会定位到具体层级，例如：
+
+- `"求解器在规定时间内无法判定可行性"`（首阶段连可行性都未能判定）；
+- `"求解器在规定时间内无法证明负载绝对偏差总和的最优值"`（第 2 层）；
+- `"求解器在规定时间内无法证明审阅人编号序列分块的字典序最优"`（编号序列破平）。
+
+> 注意：`error` 与 `infeasible` 严格区分——只有首阶段**证明**不存在满足全部回避与容量约束的分配时才返回 `infeasible`（附缺口诊断）；限时内无法判定一律 `error`，绝不会把超时误报为无解，也不会把未证明最优的方案当作择优结果返回。
 
 ## 考场卷别排布（`POST /api/tasks/{task_id}/seat-plan`）
 

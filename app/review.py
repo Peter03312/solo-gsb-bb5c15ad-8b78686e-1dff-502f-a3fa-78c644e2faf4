@@ -15,7 +15,12 @@
      （即最大化降权编码），分块处理避免指数权重溢出，同时唯一破缺
      审阅人之间的对称性，结果可复现。
 
-无解时不返回任何部分方案，仅给出各卷可用人力与总容量缺口。
+每个择优阶段（含编号序列破平的每个分块）都必须取得 OPTIMAL 最优性证明：
+任一阶段在限时内只找到可行解而未证明最优、或完全无法判定时返回 error
+且**不附任何分配方案**——偏差阶段超时不得退回上一阶段方案（其偏差未必
+最小，公开承诺的择优结果会失真），破平分块未完成时此前的解也只对已固定
+分块最优。只有首阶段被**证明无解**（INFEASIBLE）时才返回 infeasible 及
+各卷可用人力与总容量缺口诊断，绝不返回部分方案。
 全部求解单线程、固定随机种子，同一任务同一请求结果可复现。
 """
 from __future__ import annotations
@@ -107,7 +112,12 @@ def solve_review_plan(
     paper_count: int,
     seed: int = 42,
 ) -> Dict[str, Any]:
-    """求解盲审分配，返回可行方案或（无解时的）人力诊断，绝不返回部分方案。
+    """求解盲审分配。
+
+    只有全部择优阶段（含编号序列破平的每个分块）都取得最优性证明时才返回
+    可行方案；任一阶段在限时内只找到可行解而未证明最优、或完全无法判定时
+    返回 error 且不附任何分配方案；只有首阶段被证明无解时才返回 infeasible
+    及人力缺口诊断，绝不返回部分方案。
 
     reviewers 元素为 {"reviewer_id": ..., "capacity": ..., "excluded_papers": [...]}；
     审阅人编号可为数字或字符串，按与题号同一口径规范化排序后参与求解，
@@ -158,48 +168,53 @@ def solve_review_plan(
             "papers": papers_diag,
         }
 
-    # 阶段 1：最大个人负载最小
+    def error(message: str) -> Dict[str, Any]:
+        # 错误结构只含回显与诊断，绝不携带 assignments/loads 等部分方案
+        return {"status": "error", **base, "error": message}
+
+    # 阶段 1：最大个人负载最小。必须取得 OPTIMAL：仅 FEASIBLE 时其最大负载
+    # 可能并非全局最小，把它固定下来会让后续阶段在错误的上界内继续“择优”。
     m, x, loads, max_load = _build_model(caps, excluded, P, k)
     m.Minimize(max_load)
     s = _solver(seed)
     status = s.Solve(m)
     if status == cp_model.INFEASIBLE:
+        # 证明无解：返回既有缺口诊断，不返回任何部分方案
         return infeasible()
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return {
-            "status": "error",
-            **base,
-            "error": "求解器在规定时间内无法判定可行性",
-        }
+    if status == cp_model.FEASIBLE:
+        # 只找到可行解而未证明最优：不得固定该负载上界
+        return error("求解器在规定时间内无法证明最大个人负载的最优值")
+    if status != cp_model.OPTIMAL:
+        return error("求解器在规定时间内无法判定可行性")
     best_max = int(s.Value(max_load))
-    chosen: List[List[bool]] = [
-        [bool(s.Value(x[r][p])) for p in range(P)] for r in range(R)
-    ]
 
-    # 阶段 2：各人负载相对平均值的绝对偏差总和最小
+    # 阶段 2：各人负载相对平均值的绝对偏差总和最小。同样必须证明最优：
+    # 超时不得退回阶段 1 的方案——其偏差未必最小，公开承诺的择优结果会失真。
     m, x, loads, max_load = _build_model(caps, excluded, P, k)
     m.Add(max_load == best_max)
     deviation = _deviation_expr(m, loads, total)
     m.Minimize(deviation)
     s = _solver(seed)
     status = s.Solve(m)
-    best_dev: Optional[int] = None
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        best_dev = int(s.Value(deviation))
-        chosen = [[bool(s.Value(x[r][p])) for p in range(P)] for r in range(R)]
-    # 退化：阶段 2 超时则沿用阶段 1 的解，阶段 3 不固定偏差
+    # 阶段 1 已证明模型可行，本阶段只增固定等式：INFEASIBLE 只可能来自
+    # 求解器数值异常，按“未能证明”处理，绝不退化为任意可行解。
+    if status != cp_model.OPTIMAL:
+        return error("求解器在规定时间内无法证明负载绝对偏差总和的最优值")
+    best_dev = int(s.Value(deviation))
 
     # 阶段 3：按卷号展平的审阅人编号序列最小。
     # 逐卷、逐块最大化降权编码（等价于选中编号列表的字典序最小化），
     # 并固定此前各卷各块的最优值——卷间与审阅人间的对称被唯一破缺。
+    # 每个分块都必须取得 OPTIMAL：首个未完成分块之前的解只对已固定分块
+    # 最优，整段序列不满足字典序规则，因此任一未证明分块都直接报错。
     n_chunks = (R + CHUNK_BITS - 1) // CHUNK_BITS
     fixed: List[Tuple[int, int, int]] = []  # (卷 p, 块 k, 块值)
+    chosen: Optional[List[List[bool]]] = None
     for p in range(P):
         for ck in range(n_chunks):
             m, x, loads, max_load = _build_model(caps, excluded, P, k)
             m.Add(max_load == best_max)
-            if best_dev is not None:
-                m.Add(_deviation_expr(m, loads, total) == best_dev)
+            m.Add(_deviation_expr(m, loads, total) == best_dev)
             # x 以审阅人为主下标，按卷取列向量（长度 R）参与分块编码
             cols = [[x[r][q] for r in range(R)] for q in range(P)]
             for fp, fk, fv in fixed:
@@ -208,10 +223,25 @@ def solve_review_plan(
             m.Maximize(enc)
             s = _solver(seed)
             status = s.Solve(m)
-            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                break  # 保留此前已得的最优解
+            if status != cp_model.OPTIMAL:
+                return error(
+                    "求解器在规定时间内无法证明审阅人编号序列分块的字典序最优"
+                )
             fixed.append((p, ck, int(s.Value(enc))))
             chosen = [[bool(s.Value(x[r][q])) for q in range(P)] for r in range(R)]
+
+    # 内部一致性校验：最终分配必须满足全部硬约束并达到已证明的最优值；
+    # 不符说明求解过程异常，宁可报错也不返回伪最优方案。
+    assert chosen is not None  # P >= 1 且 n_chunks >= 1，阶段 3 循环必然执行
+    final_loads = [sum(1 for p in range(P) if chosen[r][p]) for r in range(R)]
+    constraints_ok = (
+        all(sum(1 for r in range(R) if chosen[r][p]) == k for p in range(P))
+        and all(not chosen[r][p] for r in range(R) for p in excluded[r])
+        and all(final_loads[r] <= caps[r] for r in range(R))
+    )
+    final_dev = sum(abs(R * final_loads[r] - total) for r in range(R))
+    if not constraints_ok or max(final_loads) != best_max or final_dev != best_dev:
+        return error("内部校验失败：最终分配与已证明的最优值不一致")
 
     assignments = [
         {"paper": p, "reviewer_ids": [ids[r] for r in range(R) if chosen[r][p]]}
@@ -221,14 +251,14 @@ def solve_review_plan(
         {
             "reviewer_id": ids[r],
             "capacity": caps[r],
-            "load": sum(1 for p in range(P) if chosen[r][p]),
+            "load": final_loads[r],
         }
         for r in range(R)
     ]
     return {
         "status": "feasible",
         **base,
-        "max_load": max(sum(chosen[r]) for r in range(R)),
+        "max_load": max(final_loads),
         "assignments": assignments,
         "loads": loads_out,
     }
